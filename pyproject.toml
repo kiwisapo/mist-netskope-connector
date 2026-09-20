@@ -1,0 +1,38 @@
+# Project metadata and shared lint/coverage policy; runtime requirements are mirrored in requirements.txt.
+[project]
+name = "mist-netskope-connector"
+version = "0.2.0"
+description = "Unofficial Mist-driven Netskope IPsec tunnel lifecycle connector"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["requests>=2.32.5,<3"]  # Keep in step with requirements.txt (used by CI and the systemd install).
+
+[dependency-groups]
+dev = ["ruff>=0.6", "coverage>=7.6"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 160  # Existing house style keeps guard conditions on one line.
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "S", "UP", "I"]
+ignore = [
+    "UP006", "UP007", "UP035", "UP045",  # typing.List/Optional retained for Python 3.9.
+    "UP031",          # %-formatting is deliberate in fixed-width diagnostic output.
+    "S101",           # unittest-style asserts are not used; pytest-style guard is irrelevant.
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106", "S108", "E501"]  # Synthetic credentials and long fixture literals.
+
+[tool.ruff.lint.isort]
+known-first-party = ["netskope_mist_connector", "test_lifecycle"]
+
+[tool.coverage.run]
+branch = true
+source = ["netskope_mist_connector"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_covered = true

@@ -1,0 +1,5 @@
+# Local Python selection; uv and Ruff track latest. CI also exercises 3.9 and 3.13.
+[tools]
+python = "3.12"
+uv = "latest"
+ruff = "latest"

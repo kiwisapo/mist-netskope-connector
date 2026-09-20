@@ -1,0 +1,39 @@
+# Keep machine-local instructions, credentials and generated state outside version control.
+# Local Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.DS_Store
+AGENTS.md
+CLAUDE.md
+
+# Internal review notes kept out of the public repository
+docs/api-assessment.md
+docs/codebase-assessment.md
+
+# Credentials, local configuration, and tenant/site data
+.env
+.env.*
+*.env
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.csv
+secrets/
+tenant-exports/
+*.log
+
+# Lifecycle service state and site-specific deployment configuration
+state/
+*.sqlite3
+*.sqlite3-*
+lifecycle.local.json

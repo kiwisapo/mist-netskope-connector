@@ -1,0 +1,41 @@
+[Unit]
+Description=Mist Netskope lifecycle reconciler
+After=network-online.target
+Wants=network-online.target
+
+# Prerequisites: create the service user/group, install the virtual environment,
+# and supply the protected environment file and lab-validated lifecycle config.
+# ExecStart enables vendor writes; this unit does not configure TLS.
+[Service]
+Type=simple
+User=mist-netskope-connector
+Group=mist-netskope-connector
+WorkingDirectory=/opt/mist-netskope-connector
+EnvironmentFile=/etc/mist-netskope-connector/service.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/mist-netskope-connector/.venv/bin/python -u /opt/mist-netskope-connector/netskope_mist_connector.py --lifecycle-config /etc/mist-netskope-connector/lifecycle.json --state-dir /var/lib/mist-netskope-connector --apply --serve
+Restart=on-failure
+RestartSec=15
+# SIGTERM lets the connection in flight finish; a pass can span several 30 s vendor timeouts.
+KillSignal=SIGTERM
+TimeoutStopSec=180
+StateDirectory=mist-netskope-connector
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/mist-netskope-connector
+
+[Install]
+WantedBy=multi-user.target

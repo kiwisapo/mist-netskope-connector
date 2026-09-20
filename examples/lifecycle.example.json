@@ -1,0 +1,214 @@
+{
+  "version": 1,
+  "profile_variable": "netskope_profile",
+  "reconcile_interval_seconds": 600,
+  "deletion_grace_seconds": 3600,
+  "mist_hourly_request_budget": 5000,
+  "cleanup_enabled": false,
+  "validation": {
+    "evidence": "",
+    "profiles_sha256": ""
+  },
+  "profiles": {
+    "srx": {
+      "connections": [
+        {
+          "id": "wan1",
+          "template_id": "${site.gatewaytemplate_id}",
+          "crypto": {
+            "phase1": {
+              "encryptionalgo": "AES256-CBC",
+              "integrityalgo": "SHA256",
+              "dhgroup": "14",
+              "lifetime_seconds": 28800,
+              "ikeversion": "2"
+            },
+            "phase2": {
+              "encryptionalgo": "AES256-CBC",
+              "integrityalgo": "SHA256",
+              "dhgroup": "14",
+              "lifetime_seconds": 7200,
+              "pfs": true
+            }
+          },
+          "secret_readback": "exact",
+          "netskope": {
+            "sourcetype": "Mixed",
+            "srcidentity": "${vars.netskope_identity}",
+            "srcipidentity": "${vars.netskope_wan_ip}",
+            "pops": ["${vars.netskope_primary_pop}", "${vars.netskope_secondary_pop}"],
+            "bandwidth": 50,
+            "encryption": "AES256-CBC",
+            "vendor": "REPLACE_WITH_VALIDATED_SRX_VENDOR",
+            "template": "REPLACE_WITH_VALIDATED_NETSKOPE_TEMPLATE",
+            "options": {
+              "reauth": false,
+              "rekey": false,
+              "xff": {
+                "enable": false
+              }
+            }
+          },
+          "mist_entries": [
+            {
+              "path": ["tunnel_configs", "${tunnel.name}"],
+              "value": {
+                "provider": "custom-ipsec",
+                "protocol": "ipsec",
+                "version": "2",
+                "ike_mode": "main",
+                "local_id": "${vars.netskope_identity}",
+                "psk": "${secret}",
+                "ike_lifetime": "${crypto.phase1.lifetime_seconds}",
+                "ipsec_lifetime": "${crypto.phase2.lifetime_seconds}",
+                "ike_proposals": [
+                  {
+                    "auth_algo": "sha2",
+                    "enc_algo": "aes256",
+                    "dh_group": "14"
+                  }
+                ],
+                "ipsec_proposals": [
+                  {
+                    "auth_algo": "sha2",
+                    "enc_algo": "aes256",
+                    "dh_group": "14"
+                  }
+                ],
+                "primary": {
+                  "hosts": ["${primary.gateway}"],
+                  "remote_ids": ["${primary.gateway}"],
+                  "probe_ips": ["${primary.probeip}"],
+                  "wan_names": ["${vars.netskope_wan_name}"]
+                },
+                "secondary": {
+                  "hosts": ["${secondary.gateway}"],
+                  "remote_ids": ["${secondary.gateway}"],
+                  "probe_ips": ["${secondary.probeip}"],
+                  "wan_names": ["${vars.netskope_wan_name}"]
+                },
+                "probe": {
+                  "type": "icmp",
+                  "interval": 10,
+                  "threshold": 3,
+                  "timeout": 5
+                },
+                "networks": ["REPLACE_WITH_SRX_NETWORK_STEERED_TO_NETSKOPE"]
+              }
+            }
+          ],
+          "health_checks": [
+            {
+              "path": ["pops", "0", "status"],
+              "equals": "up"
+            },
+            {
+              "path": ["pops", "1", "status"],
+              "equals": "up"
+            }
+          ]
+        }
+      ]
+    },
+    "ssr": {
+      "connections": [
+        {
+          "id": "wan1",
+          "template_id": "${site.gatewaytemplate_id}",
+          "crypto": {
+            "phase1": {
+              "encryptionalgo": "AES256-CBC",
+              "integrityalgo": "SHA256",
+              "dhgroup": "14",
+              "lifetime_seconds": 28800,
+              "ikeversion": "2"
+            },
+            "phase2": {
+              "encryptionalgo": "AES256-CBC",
+              "integrityalgo": "SHA256",
+              "dhgroup": "14",
+              "lifetime_seconds": 7200,
+              "pfs": true
+            }
+          },
+          "secret_readback": "exact",
+          "netskope": {
+            "sourcetype": "Mixed",
+            "srcidentity": "${vars.netskope_identity}",
+            "srcipidentity": "${vars.netskope_wan_ip}",
+            "pops": ["${vars.netskope_primary_pop}", "${vars.netskope_secondary_pop}"],
+            "bandwidth": 50,
+            "encryption": "AES256-CBC",
+            "vendor": "REPLACE_WITH_VALIDATED_SSR_VENDOR",
+            "template": "REPLACE_WITH_VALIDATED_NETSKOPE_TEMPLATE",
+            "options": {
+              "reauth": false,
+              "rekey": false,
+              "xff": {
+                "enable": false
+              }
+            }
+          },
+          "mist_entries": [
+            {
+              "path": ["tunnel_configs", "${tunnel.name}"],
+              "value": {
+                "provider": "custom-ipsec",
+                "protocol": "ipsec",
+                "version": "2",
+                "ike_mode": "main",
+                "local_id": "${vars.netskope_identity}",
+                "psk": "${secret}",
+                "ike_lifetime": "${crypto.phase1.lifetime_seconds}",
+                "ipsec_lifetime": "${crypto.phase2.lifetime_seconds}",
+                "ike_proposals": [
+                  {
+                    "auth_algo": "sha2",
+                    "enc_algo": "aes256",
+                    "dh_group": "14"
+                  }
+                ],
+                "ipsec_proposals": [
+                  {
+                    "auth_algo": "sha2",
+                    "enc_algo": "aes256",
+                    "dh_group": "14"
+                  }
+                ],
+                "primary": {
+                  "hosts": ["${primary.gateway}"],
+                  "remote_ids": ["${primary.gateway}"],
+                  "probe_ips": ["${primary.probeip}"],
+                  "wan_names": ["${vars.netskope_wan_name}"]
+                },
+                "secondary": {
+                  "hosts": ["${secondary.gateway}"],
+                  "remote_ids": ["${secondary.gateway}"],
+                  "probe_ips": ["${secondary.probeip}"],
+                  "wan_names": ["${vars.netskope_wan_name}"]
+                },
+                "probe": {
+                  "type": "icmp",
+                  "interval": 10,
+                  "threshold": 3,
+                  "timeout": 5
+                },
+                "networks": ["REPLACE_WITH_SSR_NETWORK_STEERED_TO_NETSKOPE"]
+              }
+            }
+          ],
+          "health_checks": [
+            {
+              "path": ["pops", "0", "status"],
+              "equals": "up"
+            },
+            {
+              "path": ["pops", "1", "status"],
+              "equals": "up"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

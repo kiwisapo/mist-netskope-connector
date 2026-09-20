@@ -1,0 +1,2 @@
+# Direct runtime dependency; development tools are declared in pyproject.toml.
+requests>=2.32.5,<3
