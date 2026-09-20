@@ -103,6 +103,7 @@ import math
 import os
 import re
 import secrets
+import shutil
 import signal
 import sqlite3
 import sys
@@ -320,6 +321,39 @@ def entry_hash(value, paths):
         else:
             put_path(normalized, path, '<managed-secret>')
     return fingerprint(normalized)
+
+
+def preservation_hash(document, paths):
+    """Hash unrelated configuration, omitting owned paths and server metadata.
+
+    Empty ancestors on owned paths are normalised so creating/removing the
+    first entry does not look like unrelated drift. Raw values are never saved.
+    """
+    if not isinstance(document, dict):
+        raise ReconcileError("Cannot verify unrelated template configuration")
+    remaining = copy.deepcopy(document)
+    for field in ('id', 'org_id', 'created_time', 'modified_time'):
+        remaining.pop(field, None)
+
+    def remove(parent, path):
+        if not isinstance(parent, dict) or path[0] not in parent:
+            return
+        if len(path) == 1:
+            parent.pop(path[0])
+        else:
+            remove(parent[path[0]], path[1:])
+            if parent[path[0]] == {}:
+                parent.pop(path[0])
+
+    for path in paths:
+        remove(remaining, path)
+    return fingerprint(remaining)
+
+
+def verify_preservation(document, record, field):
+    pending = record.get(field)
+    if pending and preservation_hash(document, pending['paths']) != pending['hash']:
+        raise ReconcileError("Unrelated Mist configuration changed across a write; investigate before further writes")
 
 
 def validate_crypto(crypto, pops):
@@ -673,6 +707,24 @@ class LifecycleState:
                 self.db.execute('INSERT OR REPLACE INTO connections VALUES (?, ?)', (key, body))
             self._records[key] = json.loads(body)  # Cache only what was durably committed.
 
+    def operational_status(self):
+        """Non-secret aggregate status; callers must hold the service state lock."""
+        with self.mutex:
+            row = self._open_db().execute("SELECT value FROM meta WHERE key='last_pass'").fetchone()
+            pending = self.db.execute('SELECT COUNT(*), MIN(created) FROM inbox WHERE done=0').fetchone()
+            return {'last_pass': json.loads(row[0]) if row else None,
+                    'pending_events': pending[0], 'oldest_pending_at': pending[1],
+                    'connection_count': len(self._records)}
+
+    def save_pass(self, value):
+        with self.mutex, self._open_db():
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES ('last_pass', ?)", (canonical(value),))
+
+    def prune_inbox(self):
+        # Scheduled maintenance also runs when no new webhook is delivered.
+        with self.mutex, self._open_db():
+            self.db.execute('DELETE FROM inbox WHERE done=1 AND created<?', (time.time() - INBOX_RETENTION_SECONDS,))
+
     def enqueue(self, digest):
         self.enqueue_many([digest])
 
@@ -726,6 +778,122 @@ class LifecycleState:
         if len(value) < 32:
             raise ReconcileError("Per-tunnel secret is invalid")
         return value
+
+
+def state_snapshot(state, destination):
+    """Create a private, consistent local backup while holding the worker lock."""
+    target = Path(destination)
+    if state.root.resolve() == target.resolve() or state.root.resolve() in target.resolve().parents:
+        raise ReconcileError("Backup destination must be outside the state directory")
+    created = False
+    try:
+        target.mkdir(mode=0o700)  # Never overwrite an existing backup.
+        created = True
+        (target / 'secrets').mkdir(mode=0o700)
+        for key, record in state.records().items():
+            if record.get('status') != 'deleted':
+                state.secret(key)  # Refuse a backup that cannot recover active work.
+        with state.mutex:
+            db_path = target / 'state.sqlite3'
+            state._open_private(db_path).close()
+            with contextlib.closing(sqlite3.connect(str(db_path))) as copied:
+                state._open_db().backup(copied)
+                if copied.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                    raise ReconcileError("Backup database integrity check failed")
+        files = ['state.sqlite3']
+        secrets_dir = state.root / 'secrets'
+        if secrets_dir.is_symlink():
+            raise ReconcileError("Secret directory must not be a symlink")
+        if secrets_dir.exists():
+            for source in sorted(secrets_dir.iterdir()):
+                key = source.stem
+                if source.suffix != '.psk' or not re.fullmatch('[0-9a-f]{64}', key):
+                    raise ReconcileError("Unexpected secret file in state directory")
+                state.secret(key)
+                relative = 'secrets/' + source.name
+                with open(target / relative, 'xb') as handle:
+                    os.fchmod(handle.fileno(), 0o600)
+                    handle.write(source.read_bytes())
+                files.append(relative)
+        manifest = {'version': 1, 'files': {name: hashlib.sha256((target / name).read_bytes()).hexdigest() for name in files}}
+        with open(target / 'manifest.json', 'x') as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(canonical(manifest))
+        # Durability of file contents and directory entries is explicit.
+        for path in [target / name for name in files] + [target / 'manifest.json', target / 'secrets', target, target.parent]:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        return {'files': len(files), 'status': 'backup_complete'}
+    except (OSError, sqlite3.Error, ReconcileError):
+        if created:
+            shutil.rmtree(target)
+        raise ReconcileError("Backup failed; destination must be new and state must be complete and readable") from None
+
+
+def restore_snapshot(source, destination, binding):
+    """Verify a local backup and restore into a new directory, never over live state."""
+    source, target = Path(source), Path(destination)
+    created = False
+    try:
+        if source.is_symlink() or source.stat().st_mode & 0o077 or (source / 'secrets').is_symlink():
+            raise ReconcileError("Backup must be private and must not use symlinks")
+        manifest_path = source / 'manifest.json'
+        if manifest_path.is_symlink() or manifest_path.stat().st_mode & 0o077:
+            raise ReconcileError("Invalid backup manifest permissions")
+        manifest = json.loads(manifest_path.read_text())
+        files = manifest['files']
+        if manifest.get('version') != 1 or not isinstance(files, dict) or 'state.sqlite3' not in files:
+            raise ReconcileError("Invalid backup manifest")
+        for name, digest in files.items():
+            if name != 'state.sqlite3' and not re.fullmatch(r'secrets/[0-9a-f]{64}\.psk', name):
+                raise ReconcileError("Invalid backup file path")
+            path = source / name
+            if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
+                raise ReconcileError("Invalid backup file")
+            if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                raise ReconcileError("Backup checksum mismatch")
+        if source.resolve() == target.resolve() or source.resolve() in target.resolve().parents:
+            raise ReconcileError("Restore destination must be outside the backup")
+        target.mkdir(mode=0o700)
+        created = True
+        (target / 'secrets').mkdir(mode=0o700)
+        for name, digest in files.items():
+            data = (source / name).read_bytes()
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise ReconcileError("Backup changed during restore")
+            with open(target / name, 'xb') as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+        with contextlib.closing(sqlite3.connect(str(target / 'state.sqlite3'))) as check:
+            metadata = dict(check.execute('SELECT key, value FROM meta'))
+            if metadata.get('binding') != canonical(binding) or not metadata.get('installation'):
+                raise ReconcileError("Backup identity does not match the requested tenant")
+            uuid.UUID(metadata['installation'])
+        restored = LifecycleState(target, binding)
+        try:
+            if restored.db.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                raise ReconcileError("Restored database failed integrity check")
+            for key, record in restored.records().items():
+                if record.get('status') != 'deleted':
+                    restored.secret(key)
+        finally:
+            restored.close()
+        for path in (target / 'secrets', target, target.parent):
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        return {'status': 'restore_complete'}
+    except (OSError, sqlite3.Error, ValueError, KeyError, TypeError, AttributeError, ReconcileError):
+        if created:
+            shutil.rmtree(target)
+        raise ReconcileError("Restore failed; verify backup integrity, tenant binding and a new destination") from None
 
 
 def valid_key_path(path, minimum):
@@ -872,6 +1040,14 @@ class Reconciler:
         check(payload)
         return payload
 
+    def check_template_preservation(self, current, key, record):
+        verify_preservation(current, record, 'pending_preservation')
+        verify_preservation(current, record, 'cleanup_preservation')
+        for other in self.state.template_records(record['template_id'], exclude_key=key).values():
+            if other.get('pending_preservation') or other.get('cleanup_preservation'):
+                # A different connection must not invalidate a pending baseline.
+                raise ReconcileError("Another connection has an unresolved Mist write on this template; recover it first")
+
     def plan(self, site, setting, connection, pops, rows):
         key = self.key(site['id'], connection['id'])
         record = self.state.record(key)
@@ -890,6 +1066,7 @@ class Reconciler:
         current, _ = self.api.template(template_id)
         if current is None:
             raise ReconcileError("Target Mist template is missing")
+        self.check_template_preservation(current, key, record)
         # Secret creation occurs only after structural preflight in upsert().
         try:
             secret = self.state.secret(key)
@@ -1071,19 +1248,25 @@ class Reconciler:
             if latest != current:
                 raise ReconcileError("Mist template changed during reconciliation; retry later")
             sections = {e['path'][0] for e in entries}
-            self.api.put_template(record['template_id'], self.write_sections(merged, record['template_id'], sections, exclude_key=key),
-                                  latest_etag or etag)
+            outgoing = self.write_sections(merged, record['template_id'], sections, exclude_key=key)
+            record['pending_preservation'] = {'paths': [e['path'] for e in entries],
+                                              'hash': preservation_hash(current, [e['path'] for e in entries])}
+            self.state.save(key, record)
+            self.api.put_template(record['template_id'], outgoing, latest_etag or etag)
             record['mist_secret_hash'] = fingerprint(payload['psk'])
             self.state.save(key, record)
             actual, _ = self.api.template(record['template_id'])
         else:
             actual = current  # Read moments ago and unchanged by us: no second GET needed.
+        verify_preservation(actual, record, 'pending_preservation')
         if actual is None or any(not path_value(actual, e['path'])[0] or
                                  entry_hash(path_value(actual, e['path'])[1], e['secret_paths']) != e['hash'] for e in owned):
             raise ReconcileError("Mist readback differs (including hidden secrets); validate the readback contract")
         record.update(entries=owned, mist_secret_hash=fingerprint(payload['psk']), status='configured', last_success=self.clock())
         record.pop('pending_entries', None)
         record.pop('pending_secret_hash', None)
+        record.pop('pending_preservation', None)
+        record.pop('cleanup_preservation', None)
         self.state.save(key, record)
         checks = connection.get('health_checks', [])
         health = 'not_verified'
@@ -1092,6 +1275,8 @@ class Reconciler:
                 health = 'up' if all(lookup(tunnel, check['path']) == check['equals'] for check in checks) else 'down'
             except ReconcileError:
                 health = 'unknown'
+        record.update(health=health, health_observed_at=self.clock())
+        self.state.save(key, record)
         return {'site_id': site['id'], 'connection': connection['id'], 'status': 'configured', 'health': health}
 
     def retire(self, key, record, rows):
@@ -1126,6 +1311,7 @@ class Reconciler:
         if not tunnel and record.get('status') == 'create_pending':
             raise ReconcileError("Unresolved creation cannot be declared retired")
         current, etag = self.api.template(record['template_id'])
+        self.check_template_preservation(current, key, record)
         if current is not None:
             merged = copy.deepcopy(current)
             paths = {}
@@ -1142,9 +1328,13 @@ class Reconciler:
                 if latest != current:
                     raise ReconcileError("Mist template changed during cleanup")
                 sections = {path[0] for path in paths}
-                self.api.put_template(record['template_id'], self.write_sections(merged, record['template_id'], sections, exclude_key=key),
-                                      latest_etag or etag)
+                outgoing = self.write_sections(merged, record['template_id'], sections, exclude_key=key)
+                record['cleanup_preservation'] = {'paths': [list(path) for path in paths],
+                                                  'hash': preservation_hash(current, paths)}
+                self.state.save(key, record)
+                self.api.put_template(record['template_id'], outgoing, latest_etag or etag)
                 readback, _ = self.api.template(record['template_id'])
+                verify_preservation(readback, record, 'cleanup_preservation')
                 if readback is not None and any(path_value(readback, path)[0] for path in paths):
                     raise ReconcileError("Mist cleanup readback failed")
         # Check site absence again immediately before deleting the tunnel.
@@ -1295,12 +1485,37 @@ class BoundedWebhookServer(ThreadingHTTPServer):
 
 
 def reconcile_cycle(reconciler, state):
-    """Acknowledge only inbox items present before a successful full pass."""
+    """Persist pass freshness and aggregate outcomes; acknowledge only success."""
+    state.prune_inbox()
     digests = state.pending()
-    result = reconciler.reconcile()
-    if not any(r.get('status') == 'error' for r in result):
-        state.acknowledge(digests)
-    return result
+    previous = state.operational_status()['last_pass'] or {}
+    started = time.monotonic()
+    summary = {'started_at': time.time(), 'finished_at': None, 'outcome': 'running',
+               'apply': bool(reconciler.apply), 'last_success_at': previous.get('last_success_at'),
+               'last_apply_success_at': previous.get('last_apply_success_at')}
+    state.save_pass(summary)
+    try:
+        result = reconciler.reconcile()
+        errors = sum(r.get('status') == 'error' for r in result)
+        summary.update(outcome='error' if errors else 'success', errors=errors,
+                       health={name: sum(r.get('health') == name for r in result)
+                               for name in ('up', 'down', 'unknown', 'not_verified')})
+        if not errors:
+            state.acknowledge(digests)
+            summary['last_success_at'] = time.time()
+            if summary['apply']:
+                summary['last_apply_success_at'] = summary['last_success_at']
+        return result
+    except Exception:
+        # Never persist arbitrary exception text or vendor response payloads.
+        summary['outcome'] = 'error'
+        raise
+    finally:
+        counts = getattr(reconciler.api, 'request_counts', {})
+        summary['requests'] = {vendor: counts[vendor] for vendor in ('mist', 'netskope')
+                               if isinstance(counts, dict) and type(counts.get(vendor)) is int}
+        summary.update(finished_at=time.time(), duration_seconds=time.monotonic() - started)
+        state.save_pass(summary)
 
 
 def request_budget_warning(counts, interval, budget):
@@ -1331,6 +1546,9 @@ def run_lifecycle(args):
         return 0
     if args.apply and args.dry_run:
         raise ReconcileError("Choose --apply or --dry-run")
+    modes = [args.status, args.operational_status, args.backup_state, args.restore_state, args.resolve_create]
+    if sum(bool(mode) for mode in modes) > 1 or (any(modes) and (args.apply or args.serve)):
+        raise ReconcileError("Choose one stopped-service maintenance command without apply/serve")
     cfg = Config.from_env()
     interval = config.get('reconcile_interval_seconds', 600)
     budget = config.get('mist_hourly_request_budget', MIST_DEFAULT_HOURLY_BUDGET)
@@ -1338,10 +1556,21 @@ def run_lifecycle(args):
     stopping = []  # Appended to by the signal handler; list.append takes no lock.
     with contextlib.ExitStack() as stack:
         stack.callback(api.close)
-        state = LifecycleState(args.state_dir, {'org': cfg.mist_org_id, 'netskope': cfg.netskope_tenant_url,
-                                                'mist': cfg.mist_base_url})
+        binding = {'org': cfg.mist_org_id, 'netskope': cfg.netskope_tenant_url, 'mist': cfg.mist_base_url}
+        if args.restore_state:
+            print(json.dumps(restore_snapshot(args.restore_state, args.state_dir, binding)))
+            return 0
+        if args.backup_state and not (Path(args.state_dir) / 'state.sqlite3').is_file():
+            raise ReconcileError("Backup requires an existing state database")
+        state = LifecycleState(args.state_dir, binding)
         stack.callback(state.close)
         reconciler = Reconciler(api, state, config, apply=args.apply, should_stop=lambda: bool(stopping))
+        if args.backup_state:
+            print(json.dumps(state_snapshot(state, args.backup_state)))
+            return 0
+        if args.operational_status:
+            print(json.dumps(state.operational_status(), indent=2))
+            return 0
         if args.status:
             print(json.dumps(state.records(), indent=2))
             return 0
@@ -1360,7 +1589,7 @@ def run_lifecycle(args):
             print('Pending create reset after operator confirmation and complete inventory read; no vendor write performed.')
             return 0
         if not args.serve:
-            result = reconciler.reconcile()
+            result = reconcile_cycle(reconciler, state)
             print(json.dumps(result, indent=2))
             return int(any(r.get('status') == 'error' for r in result))
         secret = os.environ.get('MIST_WEBHOOK_SECRET', '')
@@ -1399,6 +1628,7 @@ def run_lifecycle(args):
                 except ReconcileError as exc:
                     output = {'time': time.time(), 'status': 'error', 'detail': str(exc)}
                 output['requests'] = api.reset_request_counts()
+                output['operational'] = state.operational_status()
                 warning = request_budget_warning(output['requests'], interval, budget)
                 if warning:
                     output['warning'] = warning
@@ -1420,7 +1650,8 @@ def run(args: argparse.Namespace) -> int:
         if args.list_pops:
             raise ReconcileError("--list-pops cannot be combined with --lifecycle-config")
         return run_lifecycle(args)
-    if args.serve or args.apply or args.dry_run or args.profile_digest or args.status or args.resolve_create or args.confirm_no_remote_tunnel:
+    if (args.serve or args.apply or args.dry_run or args.profile_digest or args.status or args.operational_status
+            or args.resolve_create or args.confirm_no_remote_tunnel or args.backup_state or args.restore_state):
         raise ReconcileError("Lifecycle options require --lifecycle-config")
     if args.list_pops:
         api = LifecycleAPI(Config.from_env())
@@ -1441,6 +1672,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument('--listen', default='127.0.0.1', help='Receiver bind address; put behind an HTTPS reverse proxy')
     parser.add_argument('--port', type=int, default=8080, help='Receiver port (default 8080)')
     parser.add_argument('--profile-digest', action='store_true', help='Print the profiles SHA256 for the lab validation record; no credentials needed')
+    parser.add_argument('--backup-state', metavar='NEW_DIRECTORY', help='Back up journal and secrets while stopped; no vendor calls')
+    parser.add_argument('--restore-state', metavar='BACKUP_DIRECTORY', help='Restore verified backup into a new --state-dir; no vendor calls')
+    parser.add_argument('--operational-status', action='store_true', help='Read last-pass freshness and aggregate health while stopped')
     parser.add_argument('--status', action='store_true', help='Read persisted non-secret connection status while the service is stopped')
     parser.add_argument('--resolve-create', metavar='CONNECTION_KEY', help='Reset an unresolved POST only after independent confirmation it created no tunnel')
     parser.add_argument('--confirm-no-remote-tunnel', action='store_true', help='Operator confirms the uncertain POST did not create a tunnel')
